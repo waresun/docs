@@ -1,0 +1,232 @@
+从USB设备插上到驱动probe调用流程分析
+1. 当USB设备插入一个HUB时,该HUB的那个port的状态就会改变,从而系统就会知道这个改变,此时会调用hub_port_connect_change() /*driver/usb/core/hub.c*/
+
+static void hub_connect_change(struct usb_hub *hub, int portl, u16 portstatus, u16 portchange)
+
+{
+
+….
+
+usb_new_device(udev);
+
+…
+
+}
+
+2. 该函数创建一个usb_device的对象udev,并初始化它,接着调用usb_new_device()来获取这个usb设备的各种描述符并为每个interface找到对用的driver.
+
+int usb_new_device(struct usb_device *udev)
+
+{
+
+ ….
+
+err = usb_get_configuration(udev);
+
+ ….
+
+device_add(&udev->dev);
+
+}
+
+3. 该函数首先调用usb_get_configuration()来获取设备的各种描述符(设备描述符,配置描述符等),接着调用device_add()来把这个USB设备添加到USB系统中去
+
+4. device_add() -> bus_attach_device -> device_attach -> bus_for_each_drv(dev->bus, NULL, dev, __device_attach) -> __device_attach -> driver_probe_device -> driver_probe_device
+
+int driver_probe_device(struct device *drv, struct device *dev)
+
+{
+
+  …
+
+  if(drv->bus->match && !drv->bus_match(dev, drv))
+
+  …
+
+ 
+
+  ret = really_probe(dev, drv);
+
+}
+
+  对于usb驱动来说,我们通过usb_register()来注册我们的驱动程序,这个函数会为我们的驱动程序对象(usb_driver)中的bus指定为usb_bus_type:
+
+  Struct bus_type usb_bus_type = {
+
+  …
+
+  .match = usb_device_match,
+
+  ….
+
+}
+
+因此对于usb驱动会首先调用usb_device_match().
+
+static int usb_device_match(struct device *dev, struct device_driver *drv)
+
+{
+
+   if(is_usb_device(dev)) { /*dev代表整个usb设备*/
+
+         ….
+
+}
+
+else  /*dev代表一个usb设备interface*/
+
+{
+
+  …
+
+  usb_match_id();
+
+  …
+
+  usb_match_dynamic_id();
+
+  …
+
+}
+
+}
+
+这个函数只是做一些粗略的匹配,如果匹配成功则返回1,然后由really_probe来做进一步的匹配,如果匹配失败则返回0,并且really_probe也不会在执行.这个函数的调用保证了dev, drv要么都是设备级别的(即dev代表usb设备,drv代表usb设备驱动),要么都是接口级别的(即dev代表usb设备的一个interface,drv代表usb接口驱动).
+
+static int really_probe(struct device *dev, struct device_driver *drv)
+
+{
+
+  …
+
+  dev->driver = drv; //先赋值,以后的probe过程中会用到
+
+  else if(drv->probe)
+
+        ret = drv->probe(dev);
+
+…
+
+probe_failed:
+
+  dev->drvier = NULL; //probe失败,重设它
+
+  …
+
+}
+
+对于usb来说这个函数的调用有2种分支, 1: dev,drv代表的是设备级别的, 2 dev,drv代表的是接口级别的.其他情况组合在usb_device_match中被过滤掉了,
+
+分支1: dev,drv代表的是设备级别:
+
+此时的drv肯定是usb_generic_driver.因为在当前的usb系统中只有这个driver是代表整个设备的驱动,它是在usb_init中被注册的,而我们通常写的usb驱动都是代表一个interface的.
+
+struct usb_device_driver usb_generic_driver = {
+
+  …
+
+  .probe = generic_probe,
+
+  …
+
+}
+
+因此,此时的drv->probe将调用generic_probe().
+
+static int generic_probe(struct usb_device *udev)
+
+{
+
+  …
+
+  c = choose_configuration(dev);
+
+  if(c >= 0) {
+
+  err = usb_set_configuration(udev, c); //设置配置,并注册interface.
+
+  …
+
+}
+
+…
+
+}
+
+该函数为这个usb设备选择一个合适的配置,并注册这个配置下面的interface.
+
+int usb_set_configuration(struct usb_device *dev, int configuration)
+
+{
+
+  …
+
+  for(I = 0; I < nintf; i++) {
+
+  struct usb_interface *intf = cp->interface[i];
+
+  …
+
+  device_add(&intf->dev);
+
+  …
+
+}
+
+  …
+
+}
+
+该函数比较重要,但我们只关心probe过程因此省掉了很多东西.它为当前配置下的每个interface调用device_add()函数,根据前面的分析可知,这个过程将会走到接下来我们要分析的分支2.
+
+分支2: dev,drv代表的是interface级别:
+
+此时的dev代表着一个interface,而drv就代表了我们自己的usb驱动.但是我们应当看到drv是device_driver类型,而我们写的usb驱动的类型一般是usb_driver,因此这里的probe和我们自己写的probe显然不是同一个.实际上这里的drv是我们的驱动对象里内嵌的一个子对象(因为linux下所以的驱动都必须用device_driver来代表,).那这个子对象的probe函数是在哪里赋值的呢?这就要看usb_register函数了,
+
+跟踪这个函数我们可以看到这里的probe函数实际上是usb_probe_interface(所有的usb interface驱动都是一样的).
+
+ static int usb_probe_interface(struct device *dev)
+
+{
+
+ struct driver = to_usb_driver(dev->driver); //dev->driver 在really_probe中设置.
+
+ …
+
+ error = driver->probe(intf, id);  //这个就是我们自己写的probe函数了.
+
+ …
+
+}
+
+ driver->probe(intf, id);这就调用到我们自己写的代码里面了
+
+USB host驱动编写（参考drivers/usb/misc/usbled.c）
+1. usb_register注册probe，id_table
+2. 实现probe，给dev设置data(by extending struct device to contain data)
+3. device_create_file
+4. handle file read/write，取出dev的data，调用usb_control_msg发送urb
+
+USB gadget驱动编写(参考drivers/usb/gadget/zero.c和f_loopback.c)
+1. USB Controller diver is s3c_udc_driver（s3c_udc_otg.c）. reset_usbd通过dev->regs寄存器往硬件写入配置数据, 提供usb_ep + usb_ep_ops给gadget层实现usb_ep_queue给硬件发数据。usb_gadget + usb_gadget_ops给gadget层实现usb_gadget_connect打开硬件。s3c_udc memory中定义了一个usb_gadget和n个usb_ep。
+2. gadget层就是include/linux/usb/gadget.h，提供usb_ep_queue，usb_ep_enable，usb_ep_autoconfig到udc的ops。
+3. composite.c是Composite layer supporting multiple functions within any single configuration. 
+4. android.c是android的gadget驱动, 提供/sys/class/android_usb/android0/enable等文件，合作composite.c，f_adb.c等functions，去管理ep之间的数据。
+
+adb例, drivers/usb/gadget/android.c和f_adb.c:
+1.init(android.c) -> usb_composite_probe(&android_usb_driver -> android_bind -> android_init_functions -> adb_function_init -> adb_setup(f_adb.c) -> misc_register -> adb_fops [adb_read,adb_write,]
+2.进入adb模式/sys/class/android_usb/android0/enable -> enable_store -> usb_add_config -> android_bind_config -> android_bind_enabled_functions -> adb_bind_config(f_adb.c) -> usb_add_function(composite.c)
+3.数据
+s3c_udc_otg.c的s3c_udc memory有各种ep。epautoconf.c提供usb_ep_autoconfig找到ep作为ep_in, ep_out。gadget.h提供usb_ep_queue，usb_ep_dequeue用struct usb_request做传输，类似于USB主机侧的URB。
+
+特别的，android.c使用kobject_uevent_env给user space的UsbManager通信.
+
+通信协议：
+usb_control_msg(..., usb_rcvctrlpipe(int), USB_REQ_XXX, ..., data...)
+usb_ep_queue(ep, usb_request, ..)
+比如，host send USB_REQ_GET_DESCRIPTOR(chapter9.h) req in ep0, gaget respond (usb_request.buf = cdev->desc) in ep0
+1. Host transfer URB, Gadget transfer usb_request
+2. The input and output devices and their drivers expect to be able to put/get data in response to a hardware interrupt from the DMA controller when their transducer has processed one service period of data. The DMA controller can move a single sample between the device and the host buffer at a rate much faster than the sample rate of either device.
+3. For gadget to read OUT, the first is the EP0 control request handle. when OTG core got reset, s3c_udc_pre_setup() pass usb_ctrl_dma(usb_ctrl's DMA handle) to DMA. After DMA data finished from Host to Gadget, EP0 interrupt from UDC hardware. process_ep_out_intr() will handle it. process_ep_out_intr -> s3c_handle_ep0 -> s3c_ep0_setup -> case USB_REQ_SET_ADDRESS -> udc_set_address
+4. if not EP0 control, call complete_rx instead of s3c_handle_ep0(). complete_rx pass a usb_request.buf to DMA and call done() --> usb_request.complete() to pass data to upper driver.
+5. For gadget to write IN, usb_ep_queue() queues usb_request, Tx loop write to FIFO/DMA. s3c_queue -> setdma_tx -> __raw_writel(req.buf, DMA). When DMA done, USB tx interrupt caused process_ep_in_intr(). process_ep_in_intr -> complete_tx -> done() -> usb_request.complete().
