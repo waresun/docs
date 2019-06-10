@@ -1,0 +1,152 @@
+I2C情景分析
+
+SDIO架构初解
+
+谨以此文纪念过往的岁月
+以SDIO为例其会采用mmc_attach_sdio来实现驱动和设备的匹配，其本质还是根据sdio_bus的匹配规则来实现匹配。在mmc_attach_sdio中首先是mmc匹配一个bus，即采用何种bus来进行mmc bus来处理host。在这里需要理解一点就是在SDIO中，对于SD卡存储器mmc为实体设备，而对于非SD卡存储器，如SDIO接口的设备，则mmc则表征为bus，这个比较重要。除了mmc bus外还存在SDIO_BUS。
+
+int mmc_attach_sdio(struct mmc_host *host, u32 ocr)
+
+{
+
+         int err;
+
+         int i, funcs;
+
+         struct mmc_card *card;
+
+         mmc_attach_bus(host, &mmc_sdio_ops); --host匹配一条mmc bus
+
+         card = mmc_alloc_card(host, NULL); --申请一个card实体，类似于总线设备。
+
+         card->type = MMC_TYPE_SDIO;
+
+         card->sdio_funcs = funcs;
+
+         host->card = card;
+
+         for (i = 0;i < funcs;i++) {
+
+                   sdio_init_func(host->card, i + 1);
+
+         }
+
+         mmc_release_host(host);
+
+         mmc_add_card(host->card);
+
+         for (i = 0;i < funcs;i++) {
+
+                   sdio_add_func(host->card->sdio_func[i]);      
+
+}
+
+         return 0;
+
+}
+
+比较难以理解的是func，这个东东其实是一个实体设备的封装，可以认为其是一个设备。
+
+struct sdio_func *sdio_alloc_func(struct mmc_card *card)
+
+{
+
+         struct sdio_func *func;
+
+         func = kzalloc(sizeof(struct sdio_func), GFP_KERNEL);
+
+         func->card = card;
+
+         device_initialize(&func->dev);
+
+         func->dev.parent = &card->dev;  --很明显card设备为sdio设备的父设备。
+
+         func->dev.bus = &sdio_bus_type;
+
+         func->dev.release = sdio_release_func;
+
+         return func;
+
+}
+
+上面的code一目了然，其就是具体设备实体的封装，其bus类型为sdio_bus. sdio_init_func仅仅是初始化一个设备，而并没有register。在sdio_add_func实现设备的register，同理就是card实体，在mmc_add_card之前并没有注册，在mmc_add_card函数中才实现设备的注册。
+
+到此设备注册也就完成了，其实sdio总线在形式上类似于usb bus，为什么呢？编写过usb驱动的童鞋们应该知道，编写usb驱动仅仅是编写驱动的加载，并没有具体加载设备实体，导致很多童鞋的困惑，为什么没有设备的加载，其实在usb设备插入时，会动态的创建一个usb设备实体，在usb设备实体创建完成后，根据不同设备id调用相匹配的驱动。而SDIO设备设备也是一样的。上面的code比较混乱，总是让人看不出具体的设备的加载。其实在上面的code中，其中包括了mmc host的驱动。
+
+三.驱动加载
+
+我们还是以SDIO驱动为例，注册一个SDIO驱动会调用下面的函数。
+
+int sdio_register_driver(struct sdio_driver *drv)
+
+{
+
+         drv->drv.name = drv->name;
+
+         drv->drv.bus = &sdio_bus_type;
+
+         return driver_register(&drv->drv);
+
+}
+
+其实很好理解sdio_driver其实是driver的封装，并且该driver的bus为sdio_bus_type。这个设备的驱动很简单。那来看sdio_driver结构
+
+struct sdio_driver {
+
+         char *name; --驱动名称
+
+         const struct sdio_device_id *id_table;  --驱动设备ID
+
+         int (*probe)(struct sdio_func *, const struct sdio_device_id *);
+
+         void (*remove)(struct sdio_func *);
+
+         struct device_driver drv;
+
+};
+
+id_table很熟悉吧，嘿嘿在usb的驱动中如何将设备和驱动匹配就是根据这个东西。在SDIO中也是根据该id_table来进行设备和驱动的匹配。
+
+四.驱动和设备匹配
+
+在介绍了设备注册和驱动注册后，那来看这两个是怎样匹配的。记住SDIO驱动之上有两条总线一个mmc bus 一个是SDIO bus。
+
+先来看mmc bus的match
+
+static int mmc_bus_match(struct device *dev, struct device_driver *drv)
+
+{
+
+         return 1;
+
+}
+
+这个很省事，直接就是1.
+
+那在看sdio bus 的match
+
+static int sdio_bus_match(struct device *dev, struct device_driver *drv)
+
+{
+
+         struct sdio_func *func = dev_to_sdio_func(dev);
+
+         struct sdio_driver *sdrv = to_sdio_driver(drv);
+
+         if (sdio_match_device(func, sdrv))
+
+                   return 1;
+
+         return 0;
+
+}
+
+通过查看上面的具体code的实现你就会发现就是根据id_table来实现设备和驱动的匹配。
+
+五.probe
+
+不管在设备注册还是驱动注册时，如果发现存在对应的设备和驱动则会调用对应的驱动。不过记住一点是均会先调用mmc bus的probe其次是sdio bus的probe。其实现的过程与platfrom类似，不多加赘述。
+
+六.总结
+
+SDIO说白了还是一种总线，其本质还是离不开驱动和设备这两者，如果有usb驱动的经验则会很好的理解SDIO总线的驱动。在linux内核是可以触类旁通的。

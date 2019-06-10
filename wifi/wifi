@@ -1,0 +1,84 @@
+#ifconfig wlan0 up开启WIFI
+#iwlist wlan0 scan 扫描
+#iwconfig wlan0 essid "HW AP" 连接没有加密的wifi热点
+#ifconfig wlan0 192.168.43.10 netmask 255.255.255.0 up 设置IP和子网掩码（红色部分IP根据实际情况而定）
+#route add default gw 192.168.43.1 添加默认网关
+#ifconfig wlan0 up 重启
+#iwconfig wlan0 essid "HWAP" key 123456789 连接有加密的wifi热点
+#
+#
+#
+博通wifi驱动注册的起始函数dhd_module_init (drivers/net/wireless/bcm4336):
+获得固件的路径，固件路径在makemenuconfig可以指定。(4412中是在.config中指定的，且每次打开wifi时wl_android_wifi_on->dhd_net_bus_devreset->dhd_bus_devreset->dhdsdio_download_firmware刷写固件)
+注册wifi的平台驱动。wifi_ctrlfunc_register_drv
+加载wifi的sdio驱动，加载函数是dhd_wifi_platform_load_sdio(),做以下步：
+1. 调用dhd_bus_reg_sdio_notify函数等待上电后设备通知。（driver_register注册一个dummy_sdmmc_driver）
+2. bcm_wlan_set_power拉低gpio电平，让其内部电源稳压器工作
+3. 上电成功，则需要枚举设备(call bcm_wlan_set_carddetect)
+4. 如果成功获取到dhd_chipup_sem，则表示wifi芯片成功powerup，这时将sdio的notify注销掉并跳出这个循环
+5. dhd总线注册，dhd_bus_register调用driver_register注册一个bcmsdh_sdmmc_driver,依次probe到bcmsdh_sdmmc_probe,sdioh_probe,bcmsdh_probe,dhdsdio_probe. 其中dhdsdio_probe调用dhd_register_if在kernel注册net（register_netdev），释放dhd_registration_sem
+6. 拿到dhd_registration_sem,dhd_wifi_platform_load_sdio流程就走完了.
+
+
+上电和dummy_sdmmc_driver probe之间的过程
+0. drivers/mmc/host/sdhci-s3c.c中的sdhci_s3c_driver::sdhci_s3c_probe -> ext_cd_init -> ext_cd_init_hsmmc##num 导致 hsmmc##num##_notify_func = sdhci_s3c_notify_change
+1. 上电成功，则需要枚举设备这一步，bcm_wlan_set_carddetect -> mmc_force_presence_change_onoff -> hsmmc##num##_notify_func -> sdhci_s3c_notify_change -> card_tasklet
+2. sdhci_s3c_driver::sdhci_s3c_probe -> sdhci_add_host -> card_tasklet = sdhci_tasklet_card
+3. sdhci_tasklet_card -> mmc_detect_change -> mmc_rescan -> mmc_rescan_try_freq -> mmc_attach_sdio -> sdio_add_func -> device_add -> dummy_sdmmc_driver.probe
+
+数据发送/接收:
+0. 芯片会将802.11数据转换成802.3数据，所以接收的芯片数据分ETHER_TYPE_BRCM和ETHER_TYPE_IP类数据。这里假设受到的都是ETHER_TYPE_IP类数据给上层net处理，后面wifi控制部分会将ETHER_TYPE_BRCM转换成event给wpa_supplicant处理。
+
+1. 接收dhd_linux.c + dhd_sdio.c :
+dhdsdio_probe时候dhd_attach会“Set up the bottom half handler”,dhd_dpc_thread.在这个thread中顺序dhd_bus_dpc,dhdsdio_dpc,dhdsdio_readframes,dhd_rx_frame,netif_rx. dhd_attach设置的中断方式是空的，不处理数据。
+关键函数流程,dhdsdio_probe -> dhd_attach -> dhd_dpc_thread -> dhd_bus_dpc -> dhdsdio_dpc -> dhdsdio_readframes -> dhd_rx_frame -> netif_rx. netif_rx是No-NAPI方式，将数据帧放入cpu的队列，软中断后调用process_backlog将数据上传第三层网络层处理。NAPI方式软中断是调用设备私有poll函数。
+
+2. 发送dhd_linux.c + bcmsdh_sdmmc.c + bcmsdh.c:
+ndo_start_xmit -> dhd_start_xmit -> dhd_sendpkt -> dhd_bus_txdata -> dhdsdio_txpkt -> dhd_bcmsdh_send_buf -> bcmsdh_send_buf -> sdioh_request_buffer -> sdioh_buffer_tofrom_bus -> sdio_memcpy_toio
+
+wpa_supplicant和kernel（driver）通信接口主要包括三种重要的接口：
+1.PF_INET socket接口，主要用于向kernel 发送ioctl命令，控制并获取相应信息。
+2.PF_NETLINK socket接口，主要用于 接收kernel发送上来的event事件。
+3.PF_PACKET socket接口，主要用于向driver传递802.1X报文。
+
+打开/关闭wifi(SIOCSIFFLAGS)(ifconfig wlan0 up/down)：
+-1. dhd_register_if register_netdevice "net->name = wlan" 和net_device_ops(.ndo_open = dhd_open)
+0. AF_INET的(inet_family_ops)inet_create create an inet socket时，sock->ops->ioctl = inet_ioctl
+1. sock_ioctl -> sock_do_ioctl -> inet_ioctl -> dev_change_flags -> __dev_change_flags -> __dev_open -> ndo_open -> dhd_open -> wl_android_wifi_on -1-> dhd_net_wifi_platform_set_power -> wifi_platform_set_power -> bcm_wlan_set_power
+-2->dhd_net_bus_resume -> dhd_bus_resume -> bcmsdh_start -> sdioh_start -> sdio_reset_comm
+
+wpa_supplicant的wext部分直接使用ioctl系统接口, 而nl80211部分使用netlink系统调用.
+ioctl通讯过程(SIOCIWFIRST, SIOCIWLAST), 以SIOCGIWSCAN为例:
+step 0: wpa_supplicant的driver_wext调用的是wpa_driver_wext_get_scan_results->wpa_driver_wext_giwscan->ioctl. driver_nl80211.c调用的是libnl, libnl是netlink的帮助库.
+
+step 1.1:初始化wext cfg ioctl handler
+ dhdsdio_probe -> dhd_attach -> wl_cfg80211_attach -> wl_setup_wiphy -> wiphy_new -> {rdev->wiphy.wext = &cfg80211_wext_handler;} -> { cfg80211_wext_handler.standard = cfg80211_handlers }
+
+step 1.2:初始化event loop
+ wl_cfg80211_attach -> wl_init_priv -> PROC_START(wl_event_handler) -> wl_event_handler -> cfg->evt_handler[WLC_E_ESCAN_RESULT] -> wl_escan_handler
+
+step 2.1:转换芯片数据为event, scan result
+ dhd_rx_frame -> dhd_wl_host_event -> wl_cfg80211_event -> wl_enq_event -> {list_add_tail(cfg->eq_list)} -> wl_event_handler{wl_deq_event} -> wl_escan_handler
+
+step 2.2:scan event触发bss处理历程
+ wl_escan_handler --> wl_inform_bss --> wl_inform_single_bss --> cfg80211_inform_bss_frame --> cfg80211_bss_update --> cfg80211_bss_update {list_add_tail(&res->list, &dev->bss_list);}
+
+step 3:系统调用入口
+ sock_ioctl -> dev_ioctl -> wext_handle_ioctl -> wext_ioctl_dispatch -> wireless_process_ioctl -> { handlers = dev->ieee80211_ptr->wiphy->wext;  ioctl_standard_call(handlers->standard[index]) } -> cfg80211_handlers[IW_IOCTL_IDX(SIOCGIWSCAN)]
+
+step 4:系统调用读取bss
+ wext-compat.c: cfg80211_handlers[IW_IOCTL_IDX(SIOCGIWSCAN)] = (iw_handler) cfg80211_wext_giwscan --> ieee80211_scan_results {list_for_each_entry(bss, &dev->bss_list, list)}
+
+
+
+
+电源管理相关的调用逻辑：
+依赖两个接口进入休眠，early_suspend和suspend。android电源管理系统中定义了一个early_suspend结构链表, wifi模块必须注册一个early_suspend实例。
+dhd_early_suspend -> dhd_suspend_resume_helper -> dhd_set_suspend -> dhd_wl_ioctl_cmd(WLC_SET_PM) -> dhd_wl_ioctl -> dhd_prot_ioctl -> dhdcdc_set_ioctl ...
+在完成early_suspend流程后，系统检测wake_lock，如果没有进程持有wake_lock，系统进入suspend流程。
+
+
+Wifi控制部分通信走两种接口： 
+A、基于网口的ioctl机制，如wext接口，android或厂家的独有命令，通过register_netdev注册网络ioctl接口，每个网口注册一个； 
+B、基于消息机制，使用netlink接口，如 cfg80211、nl80211，通过wiphy_register注册wiphy接口，每个网口注册一个wiphy
+

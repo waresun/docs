@@ -1,0 +1,15 @@
+协议：由一组tansaction组成。master发起一个tansaction。每次transaction，master首先拉高SCL拉底SDA开始一个START，紧接着8个时钟上传一个字节，前7个字节是地址，后1个字节是读写方向。第9个时钟master/slave给一个ACK/NACK。然后8个时钟一个字节+1个时钟一个ACK/NACK。最后master首先拉底SCL拉高SDA开始一个STOP结束transaction。
+寄存器：需要协议寄存器族，状态寄存器，数据寄存器。
+花开两朵个表一支，先说MCU。和串口类似，直接写协议族寄存器配置bus，查找slave的datasheet表获得addr和目标register，直接读写寄存器完成transaction。
+Host这边。
+1. i2c bus有bus driver，位于drivers/i2c/busses/。device有device driver，比如drivers/iio/CwMcuSensor, 相机驱动
+2. ****transaction完整路径为，device driver调用i2c-core.c中的多个方法i2c_smbus_xfer，i2c_master_send; 进而调用adapter->algo->smbus_xfer(或者master_xfer)。这个algo由bus driver在probe过程中设置好。这样device驱动的读写操作最后有bus驱动通过总线读写给device。
+3. instantiate i2c bus两种方式创建：platform_add_devices，devicetree。
+4. instantiate i2c device有多种方式：
+	a. Declare the I2C devices by bus number:i2c_register_board_info+i2c_board_info(含addr)；
+	b. devicetree；
+	c. 用户相机驱动的Instantiate the devices explicitly:i2c_new_device+i2c_board_info(含addr)。	 
+5. 用户空间访问设备途径：1. 直接读写总线，通过I2C-dev模块。2. device驱动提供sys接口(比如CW sensor hub) 3, IIO driver
+6. CW sensor bub例子：
+使用i2c core的i2c_smbus_read_i2c_block_data，需要两个参数：addr，sensor hub那边的designated register。hub的register表由头文件include/linux/CwMcuSensor.h提供。probe的时候i2c_client的addr来自于dts，同时也可以通过sys接口修改
+驱动同时配置gpio开关，CW还提供自己的用户空间sys接口配置和读取传感器的数据，update hub firmware。

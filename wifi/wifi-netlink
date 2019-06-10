@@ -1,0 +1,17 @@
+socket的family, protocol, type, addr处理入口
+1. socket family: AF_INET/AF_NETLINNK/AF_PACKET都通过sock_register注册family对应的ops(family_ops主要提供create方法）
+
+2. socket protocol:
+2.1 AF_INET的protocol+type决定着不同的sock接口，即两个ops：sock->ops, sock->sk->sk_prot。因为AF_INET维护了一个inetsw列表: 1.inet_init会将inetsw_array中定义的ops和prot通过inet_register_protosw注册进inetsw列表; 2. inet_create create socket时候设置sock->ops = inetsw[protocol]->ops和sock->sk->sk_prot = inetsw[protocol]->prot; 3.从应用层的系统调用进入sock->ops时一般优先调用sk_prot中的方法了。
+
+2.2 AF_NETLINK的type基本无用，protocol用于索引同种协议类型的不同netlink套接字实例的哈希表，即nl_table[protocol].hash。创建kernel netlink(NETLINK_ROUTE，NETLINK_ROUTE)或者用户netlink绑定pid时ho会调用netlink_insert。插入操作netlink_insert大致流程是：nl_table[sk->sk_protocol].hash找到protocol的nl_pid_hash结构，内嵌以pid散列值下标的head链表头指针的table, head = nl_pid_hashfn(hash, pid)由pid的散列值找到table中链表头，遍历链表确认找不到pid后插入这个sock。给目标sock发送数据是会调用netlink_lookup。查找操作netlink_lookup大致流程是根据入参dst_pid的散列值遍历链表找到目标sock。netlink_kernel_create的内核netlink的pid=0，用户netlink的pid是current的pid。
+至于sock接口，__netlink_create将sock->ops赋值为netlink_ops，另外特殊的内核netlink_kernel_create方式创建的netlink多带了input参数设为netlink_rcv接口，比如NETLINK_GENERIC协议socket的netlink_rcv的genl_rcv_msg，这个接口是后面处理netlink family+cmd的入口。大概流程是：sock->ops->sendmsg -- netlink_unicast -- netlink_unicast_kernel -- nlk->netlink_rcv -- genl_rcv -- genl_rcv_msg -- {family = genl_family_find_byid(nlh->nlmsg_type);ops = genl_get_cmd(hdr->cmd, family);ops->doit(skb, &info);}
+
+3 netlink family+cmd应用
+3.1 netlink family注册：genl_register_family + genl_register_ops
+比如net/wireless/nl80211.c的nl80211_init函数调用genl_register_family_with_ops(&nl80211_fam,nl80211_ops,..)注册了"nl80211"
+net/netlink/genetlink.c的genl_init函数调用genl_register_family_with_ops(&genl_ctrl, &genl_ctrl_ops,..)注册了"nlctrl"
+
+3.2 netlink family使用:
+应用层，wpa_supplicant_8:src/drivers/driver_nl80211.c在{global->nl80211_id = genl_ctrl_resolve(global->nl, "nl80211");}{genlmsg_put(msg, 0, 0, genl_ctrl_resolve(global->nl, "nlctrl")}中获取了family. 然后将这个family添加到netlink message的header的nlmsg_type字段, cmd添加到netlink message的data。
+内核层，genl_rcv_msg根据nlh->nlmsg_type从family链表中解出family(nl80211)，在从family的ops链表中找出cmd对应的op(比如NL80211_CMD_TRIGGER_SCAN对应nl80211_trigger_scan)

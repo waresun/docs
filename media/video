@@ -1,0 +1,12 @@
+A. MediaCodec:
+1. hardware codecs (libstagefrighthw.so) run in media.player process, software codecs (frameworks/av/media/libstagefright/codecs) run in media.codec process. 
+于是它们要提供IOMX binder，它发起addVendorPlugin，addPlugin(new SoftOMXPlugin)去load库so文件。提供allocateNode去create OMXNodeInstance (在codec库内部也有实例，比如SoftOMXComponent)。IOMX的接口都会映射进去，比如OMX_GetParameter = internalGetParameter
+2. OMXClient从media.player和media.codec服务获取IOMX的bp代理对象。
+3. MediaCodec --> ACodec --> OMXClient --> IOMX  --> IOMXMaster --> OMXNodeInstance --> SoftOMXComponent路径建立好了.
+4. Video codec's buffer fill Surface. see dequeueBuffer and queueBuffer in ACodec.cpp
+5. Audio codec's buffer fill AudioTrack.
+
+B. MediaSync
+1. create BufferQueue. pass Producer surface to codec to fill buffer. Consumer pass buffer to app surface via the path: MediaSync::InputListener::onFrameAvailable -> MediaSync::onFrameAvailableFromInput -> MediaSync::onDrainVideo_l -> renderOneBufferItem_l -> { mOutput->attachBuffer, mOutput->queueBuffer}
+
+ExoPlayer的avsync逻辑

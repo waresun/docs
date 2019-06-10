@@ -1,0 +1,141 @@
+音视频同步，即avsync，是影响多媒体应用体验质量的一个重要因素。
+本系列文章将从四个角度来深入研究Android平台上的音视频同步机制，以求为遇到音视频不同步问题的朋友提供一个思路：
+
+（1）ExoPlayer avsync逻辑梳理
+
+ExoPlayer是Google开源的一套Android多媒体播放框架，可以很好的支持HLS，DASH等流媒体协议，已经得到Youtube, HBO等视频app的应用。通过梳理ExoPlayer的avsync逻辑，有助于我们从应用的角度理解Android平台的音视频同步机制。
+
+（2）NuPlayer avsync逻辑梳理
+
+NuPlayer是Android framework层的播放器，一般来说，我们在应用层使用MediaPlayer时，都会调用到framework中的NuPlayer去。当然，如果硬件厂商有自己定制的播放器，则要另说了。通过梳理NuPlayer的avsync逻辑，有助于我们从framework层的角度理解Android平台的音视频同步机制。
+
+（3）如何利用MediaSync进行音视频同步
+
+MediaSync是Android M新加入的API，专用于音视频同步，配合MediaCodec和AudioTrack使用，这里将介绍如何使用它以及它背后的原理。由此，我们可以一窥Google在Android多媒体播放框架上的规划。
+
+（4）如何从零开始写一个音视频同步的播放器
+
+我们知道，最简单朴素的音视频同步逻辑是直接对齐两者的pts，而各种播放器所采用的音视频同步机制其实都比这复杂得多，那么这些复杂的逻辑中哪些是必要的，哪些逻辑的影响更大，通过从零开始写一个最简单的播放器，并且一步步优化它的音视频同步结果，有助于我们理解以上的问题。
+
+在本概述中，将先介绍一些音视频同步相关的背景知识。
+
+如何测试音视频同步情况
+当然你可以直接播放一段相声，然后目测声音和嘴型是否对的上。但是这里还是要推荐一个更科学的设备：Sync-One
+Sync-One是从纯物理的角度来测试音视频同步情况的，通过播放特定的测试片源，并检测声音和屏幕亮度的变化，评判声音是落后于视频，还是领先于视频，如果达到了完美的音视频同步结果，会在电子屏上显示数字0，当然这很难==，一般我们会设定一个标准区间，只要结果能落在这个区间内，即可认为视音频基本是同步的。
+
+如何制定音视频同步的标准
+音视频同步的标准其实是一个非常主观的东西，仁者见仁智者见智。我们既可以通过主观评价实验来统计出一个合理的区间范围，也可以直接参考杜比等权威机构给出的区间范围。同时，不同的输出设备可能也需要给不同的区间范围。比如，我们制定的speaker输出时的音视频同步区间是[-60, +30]ms, 蓝牙音箱输出时的音视频同步区间是[-160, +60]ms, 功放设备输出时的音视频同步区间是[-140, +40]ms。负值代表音频落后于视频，正值代表音频领先于视频。
+
+在梳理音视频同步逻辑我们应该关注什么
+毫无疑问，音视频同步逻辑的梳理要分别从视频和音频两个角度来看。
+视频方面，我们关注的是同步逻辑对视频码流的pts做了哪些调整。
+音频方面，我们关注的是同步逻辑中是如何获取“Audio当前播放的时间”的。
+
+ExoPlayerImplInternal是Exoplayer的主loop所在处，这个大loop不停的循环运转，将下载、解封装的数据送给AudioTrack和MediaCodec去播放。
+MediaCodecAudioRenderer和MediaCodecVideoRenderer分别是处理音频和视频数据的类，在MediaCodecAudioRenderer中会调用AudioTrack的write方法，写入音频数据，同时还会调用AudioTrack的getTimeStamp、getPlaybackHeadPosition、getLantency方法来获得“Audio当前播放的时间”。在MediaCodecVideoRenderer中会调用MediaCodec的几个关键API，例如通过调用releaseOutputBuffer方法来将视频帧送显。在MediaCodecVideoRenderer类中，会依据avsync逻辑调整视频帧的pts，并且控制着丢帧的逻辑。
+VideoFrameReleaseTimeHelper可以获取系统的vsync时间和间隔，并且利用vsync信号调整视频帧的送显时间。
+
+下面我会先简要的介绍ExoPlayer avsync逻辑中的关键点，最后再进行详细的代码分析。
+
+Video部分
+1.利用pts和系统时间计算预计送显时间（视频帧应该在这个时间点显示）
+
+MediaCodecVideoRenderer#processOutputBuffer
+
+//计算 “当前帧的pts(bufferPresentationTimeUs )” 与“Audio当前播放时间(positionUs )”之间的时间间隔，
+//最后还减去了一个elapsedSinceStartOfLoopUs的值，代表的是程序运行到此处的耗时，
+//减去这个值可以看做一种使计算值更精准的做法
+  long elapsedSinceStartOfLoopUs = (SystemClock.elapsedRealtime() * 1000) - elapsedRealtimeUs;
+  earlyUs = bufferPresentationTimeUs - positionUs - elapsedSinceStartOfLoopUs;
+ // Compute the buffer's desired release time in nanoseconds.
+ // 用当前系统时间加上前面计算出来的时间间隔，即为“预计送显时间” 
+  long systemTimeNs = System.nanoTime();
+  long unadjustedFrameReleaseTimeNs = systemTimeNs + (earlyUs * 1000);
+
+2、利用vsync对预计送显时间进行调整
+
+MediaCodecVideoRenderer#processOutputBuffer
+
+long adjustedReleaseTimeNs = frameReleaseTimeHelper.adjustReleaseTime(
+      bufferPresentationTimeUs, unadjustedFrameReleaseTimeNs);
+
+adjustReleaseTime方法里面干了几件事：
+a.计算ns级别的平均帧间隔时间，因为vsync的精度是ns
+
+b.寻找距离当前送显时间点（unadjustedFrameReleaseTimeNs）最近(可能是在送显时间点之前，也可能是在送显时间点之后)的vsync时间点，我们的目标是在这个vsync时间点让视频帧显示出去
+
+c.上面计算出的是我们的目标vsync显示时间，但是要提前送，给后面的显示流程以时间，所以再减去一个vsyncOffsetNs时间，这个时间是写死的，定义为.8*vsyncDuration，减完之后的这个值就是真正给MediaCodec.releaseOutputBuffer方法的时间戳
+
+这里其实有问题：首先是这里的0.8系数设置的是否合理，其次是否能有办法验证这一帧真的在这一个vsync信号时间点显示出去了。按照mediacodec.releaseOutputbuffer的说法注释，应该在两个vsync信号之前调用release方法，但是从目前的做法来看并没有follow注释的说法。
+调研之后，我们发现，利用dumpsys SurfaceFlinger --latency SurfaceView方法我们可以知道每一帧的desiredPresentationTime和actualPresentationTime，经过实测，在一些平台上这两个值得差距在一个vsync时间以上，一般为22ms左右，所以ExoPlayer里面设置的这个0.8的系数也许不甚合理。其次我们观察了NuPlayer的avsync逻辑，发现在NuPlayer中就是严格按照releaseOutputbuffer注释所说的，提前两个vsync时间调用release方法。
+上面的提到的注释内容如下
+
+/**
+     * If you are done with a buffer, use this call to update its surface timestamp
+     * and return it to the codec to render it on the output surface. If you
+     * have not specified an output surface when configuring this video codec,
+     * this call will simply return the buffer to the codec.<p>
+     *
+     * The timestamp may have special meaning depending on the destination surface.
+     *
+     * <table>
+     * <tr><th>SurfaceView specifics</th></tr>
+     * <tr><td>
+     * If you render your buffer on a {@link android.view.SurfaceView},
+     * you can use the timestamp to render the buffer at a specific time (at the
+     * VSYNC at or after the buffer timestamp).  For this to work, the timestamp
+     * needs to be <i>reasonably close</i> to the current {@link System#nanoTime}.
+     * Currently, this is set as within one (1) second. A few notes:
+     *
+     * <ul>
+     * <li>the buffer will not be returned to the codec until the timestamp
+     * has passed and the buffer is no longer used by the {@link android.view.Surface}.
+     * <li>buffers are processed sequentially, so you may block subsequent buffers to
+     * be displayed on the {@link android.view.Surface}.  This is important if you
+     * want to react to user action, e.g. stop the video or seek.
+     * <li>if multiple buffers are sent to the {@link android.view.Surface} to be
+     * rendered at the same VSYNC, the last one will be shown, and the other ones
+     * will be dropped.
+     * <li>if the timestamp is <em>not</em> "reasonably close" to the current system
+     * time, the {@link android.view.Surface} will ignore the timestamp, and
+     * display the buffer at the earliest feasible time.  In this mode it will not
+     * drop frames.
+     * 注意这里！！！！！！
+     * <li>for best performance and quality, call this method when you are about
+     * two VSYNCs' time before the desired render time.  For 60Hz displays, this is
+     * about 33 msec.
+     * </ul>
+     * </td></tr>
+     * </table>
+     *
+     * Once an output buffer is released to the codec, it MUST NOT
+     * be used until it is later retrieved by {@link #getOutputBuffer} in response
+     * to a {@link #dequeueOutputBuffer} return value or a
+     * {@link Callback#onOutputBufferAvailable} callback.
+     *
+     * @param index The index of a client-owned output buffer previously returned
+     *              from a call to {@link #dequeueOutputBuffer}.
+     * @param renderTimestampNs The timestamp to associate with this buffer when
+     *              it is sent to the Surface.
+     * @throws IllegalStateException if not in the Executing state.
+     * @throws MediaCodec.CodecException upon codec error.
+     */
+    public final void releaseOutputBuffer(int index, long renderTimestampNs)
+
+3、丢帧和送显
+
+MediaCodecVideoRenderer#processOutputBuffer
+//计算实际送显时间与当前系统时间之间的时间差
+earlyUs = (adjustedReleaseTimeNs - systemTimeNs) / 1000;
+  //将上面计算出来的时间差与预设的门限值进行对比
+  if (shouldDropOutputBuffer(earlyUs, elapsedRealtimeUs)) {
+    dropOutputBuffer(codec, bufferIndex);
+    return true;
+  }
+…
+ if (earlyUs < 50000) {
+ //视频帧来的太晚会被丢掉, 来的太早则先不予显示，进入下次loop，再行判断 
+ renderOutputBufferV21(codec, bufferIndex, adjustedReleaseTimeNs);
+
+如果earlyUs 时间差为正值，代表视频帧应该在当前系统时间之后被显示，换言之，代表视频帧来早了，反之，如果时间差为负值，代表视频帧应该在当前系统时间之前被显示，换言之，代表视频帧来晚了。如果超过一定的门限值，即该视频帧来的太晚了，则将这一帧丢掉，不予显示。按照预设的门限值，视频帧比预定时间来的早了50ms以上，则进入下一个间隔为10ms的循环，再继续判断，否则，将视频帧送显。
+
