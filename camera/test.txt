@@ -1,0 +1,98 @@
+step 1
+uvc_open
+libusb_submit_transfer
+usbi_backend->submit_transfer
+op_submit_transfer
+submit_control_transfer/submit_bulk_transfer
+
+
+step 2
+UVCPreview::do_preview
+uvc_start_streaming_bandwidth
+uvc_stream_start_bandwidth
+libusb_submit_transfer + pthread_create(_uvc_user_caller) + libusb_fill_bulk_transfer(_uvc_stream_callback)
+
+step 3
+_uvc_user_caller loop
+_uvc_populate_frame
+strmh->user_cb
+UVCPreview::uvc_preview_frame_callback
+
+step 4
+UVCPreview::uvc_preview_frame_callback
+addPreviewFrame
+waitPreviewFrame in do_preview loop
+draw_preview_one
+copyToSurface
+
+step 5
+uvc_open
+uvc_start_handler_thread
+pthread_create(_uvc_handle_events)
+_uvc_handle_events
+libusb_handle_events
+libusb_handle_events_timeout_completed
+handle_events
+usbi_backend->handle_events
+op_handle_events
+reap_for_handle
+handle_bulk_completion
+usbi_handle_transfer_completion
+_uvc_stream_callback
+_uvc_process_payload
+_uvc_swap_buffers
+goto _uvc_user_caller
+
+
+
+MenuActivity ---setCurFunctionType--> SecondScreenService ---startPreview---> AbstractUVCCameraHandler
+
+AbstractUVCCameraHandler
+||
+VV
+setPreviewDisplay
+setFrameCallback
+updateCameraParams
+||
+VV
+UVCCamera
+
+UVCCamera ---> serenegiant_usb_UVCCamera --> UVCCamera.cpp
+
+
+UVCPreview.cpp -- java AbstractUVCCameraHandler.onFrame --> EventBus + saveBitmapToFile + MediaVideoBufferEncoder.encode
+
+2.MediaPlayer to TextureRenderView:
+TextureView.getTextureLayer {mSurface = new SurfaceTexture}
+TextureRenderView.onSurfaceTextureAvailable{surface}
+TextureRenderView.bindMedia --setSurface--> MediaPlayer
+
+
+3.camera to UVCCameraTextureView:
+3.1
+TextureView.getTextureLayer {mSurface = new SurfaceTexture}
+UVCCameraTextureView.onSurfaceTextureAvailable(mSurface）
+UVCCameraTextureView.RenderThread.init{mEglSurface = mEgl.createFromSurface(mSurface);}
+3.2
+SecondScreenService.onReadyPreview
+UVCCameraTextureView.getSurfaceTexture === updatePreviewSurface{mPreviewSurface = new SurfaceTexture(mTexId)}
+AbstractUVCCameraHandler.startPreview(surface)
+AbstractUVCCameraHandler.handleStartPreview(surface)
+UVCCamera.setPreviewDisplay(surface)
+3.3
+SurfaceTexture.postEventFromNative
+UVCCameraTextureView.onFrameAvailable
+UVCCameraTextureView.onDrawFrame
+mPreviewSurface >>> mEglSurface
+
+
+4.camera to MediaCodec:
+MediaVideoBufferEncoder.encode
+MediaCodec.queueInputBuffer
+MediaCodec.dequeueOutputBuffer
+MediaMuxer.writeSampleData
+
+5.screen to recorder:
+SurfaceMediaRecorder.start{mSurface = MediaRecorder.getSurface();}
+SurfaceMediaRecorder.Runnable.run{canvas = mSurface.lockCanvas(null)}
+ViewRecorder.VideoFrameDrawer.onDraw{view.draw(canvas);}
