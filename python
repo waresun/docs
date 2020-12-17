@@ -1,0 +1,4 @@
+1. help(any)
+2. print(xxxx.__code__)或者print(xxxx.__file__)
+3. print(type(obj))
+4. 
