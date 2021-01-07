@@ -1,0 +1,64 @@
+1. 模型转换例子， keras2onnx
+
+import keras
+import keras2onnx
+import onnx
+import onnxruntime
+import cv2
+import numpy as np
+from keras.models import load_model
+from onnx import TensorProto
+model = load_model('/home/wei/work/product/ARAPP/HyperLPR/model/plate_type.h5')  
+onnx_model = keras2onnx.convert_keras(model, model.name)
+graph = onnx_model.graph
+new_nv = onnx.helper.make_tensor_value_info('conv2d_11_input', TensorProto.FLOAT, ["N",3,9,34])
+#删除原有输入
+del onnx_model.graph.input[:]
+#重建输入
+onnx_model.graph.input.extend([new_nv])
+print(onnx_model.graph.input)
+node  = graph.node
+new_nodes = node[1:]
+#删除原有节点
+del graph.node[:]
+#重建节点
+graph.node.extend(new_nodes)
+con = graph.node[0]
+con.input[0]='conv2d_11_input'
+#保存模型
+temp_model_file = '/home/wei/work/product/ARAPP/HyperLPR/model/plate_type2.onnx'
+onnx.save_model(onnx_model, temp_model_file)
+
+2. 运行onnx模型例子
+
+import numpy as np
+import cv2
+import keras2onnx
+import onnxruntime
+sess = onnxruntime.InferenceSession("/home/wei/work/product/ARAPP/HyperLPR/model/plate_type2.onnx")
+image = cv2.imread("/home/wei/temp/1/0_rough.jpg")
+image = cv2.resize(image, (34, 9))
+image = image.astype(np.float32) / 255
+#转置hwc成chw
+image_chw = np.transpose(image, (2,0,1))
+#3维->4维
+input_array = np.array([image_chw])
+print("@@@", input_array.shape)
+#input_array = np.expand_dims(input_array, axis=0)
+#input_array = image.reshape((1, 9, 34, 3))
+#print(input_array)
+input_name = sess.get_inputs()[0].name
+pred_onx = sess.run(None, {input_name: input_array})
+print(pred_onx)
+sess2 = onnxruntime.InferenceSession("/home/wei/work/product/ARAPP/HyperLPR/model/plate_type.onnx")
+image2 = cv2.imread("/home/wei/temp/1/0_rough.jpg")
+image2 = cv2.resize(image2, (34, 9))
+image2 = image2.astype(np.float32) / 255
+#3维->4维
+input_array2 = np.expand_dims(image2, axis=0)
+print("###", input_array2.shape)
+input_name2 = sess2.get_inputs()[0].name
+pred_onx2 = sess2.run(None, {input_name2: input_array2})
+print(pred_onx2)
+
+3. 待须
