@@ -1,0 +1,5 @@
+AOP语法：
+1. 在@Aspect注解的类里定义一个切面@Pointcut，其他事件都注解在这个Pointcut方法名上。
+2. @Pointcut有两种语法，一个是execution指定到类，一个是指定到自定义标注名，比如@annotation(xxxx)。这个xxxx定义参加3。
+3. 自定义注解用@interface标注类，在期望的切面处注解@xxxxx。
+4. 通俗地理解，注解是对被注解类的增强，即把注解提供类上的方法增强到被注解类的方法上去。
