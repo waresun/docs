@@ -7,3 +7,6 @@ AOP语法：
 多环境yml:
 1. java -jar xxx.jar --spring.profiles.active=release #运行
 2. mvn clean package -P release #编译
+
+RestTemplate:
+是给Spring boot作为客户端调用服务端的restful接口使用的。语法是在一个bean里提供实例，定义Interceptor定制行为。
