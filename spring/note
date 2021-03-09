@@ -10,3 +10,9 @@ AOP语法：
 
 RestTemplate:
 是给Spring boot作为客户端调用服务端的restful接口使用的。语法是在一个bean里提供实例，定义Interceptor定制行为。
+
+MyBatis
+
+Netty
+
+openFeign
