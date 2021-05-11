@@ -15,4 +15,5 @@ MyBatis
 
 Netty
 
-openFeign
+openFeign+Eureka
+取代RestTemplate用的，更简单。并通过动态代理的方式产生实现类来做负载均衡并进行调用其他服务。Eureka用于发现服务，Service Discovery。
