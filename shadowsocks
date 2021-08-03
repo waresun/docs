@@ -43,3 +43,12 @@ EVP_CIPHER_CTX_cleanup -> EVP_CIPHER_CTX_reset
 }
 
 ssserver -c /etc/shadowsocks/config.json -d start
+
+python3:
+sudo apt-get install python3-setuptools
+sudo apt-get install python3-pip
+export LC_ALL=C
+pip3 install shadowsocks
+mkdir /etc/shadowsocks
+vim /etc/shadowsocks/config.json
+ssserver -c /etc/shadowsocks/config.json -d start
