@@ -7,3 +7,6 @@
 ip源地址转换都指向公网EIP绑定的主机内网地址
 6，iptables -t nat -A PREROUTING -d 192.168.1.6 -p tcp --dport 3306 -j DNAT --to-destination 192.168.1.14:3306
 将192.168.1.6的TCP 3306端口映射到192.168.1.14的TCP 3306端口
+
+80端口重定向
+iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 9995
